@@ -1,42 +1,103 @@
-# Qwen3 ForcedAligner API
+# qwen-fa-docker-config
 
-Torch 기반 Qwen3 ForcedAligner HTTP 서버입니다. 서버는 시작 시 모델을 한 번 로드하고, canonical WAV 전체와 ASR 청크 메타데이터를 `POST /align` 한 번으로 받습니다. 구간 추출, 요청 내부 microbatch 정렬, 전체 파일 기준 시간 보정은 FA 안에서 수행합니다.
+Single-container Docker deployment for Qwen3 ForcedAligner. The container loads `Qwen3-ForcedAligner-0.6B` once, then aligns one canonical WAV and an ASR chunk payload on `POST /align`.
 
-ASR 호출, 자막 조립, 겹침 중복 제거, InferSwap 연동은 이 서버의 범위가 아닙니다. InferSwap은 이후 단계에서 런타임 전환을 담당합니다.
+The runtime is one Compose service:
 
-## 실행
+- `fa-api`: FastAPI server for WAV checks, chunk slicing, in-request microbatching, and file-absolute timestamps
+
+Calling ASR, assembling subtitles, removing overlap duplicates, and swapping runtimes stay outside this container.
+
+## Architecture
+
+```text
+[client]
+   |
+   v
+[fa-api :8090]
+   |
+   +--> Qwen3-ForcedAligner-0.6B on cuda:0
+```
+
+The client is expected to already have a 16 kHz mono signed-16 PCM WAV and the unmodified ASR JSON for that file. This server reads `audio` and `chunks` from that JSON and ignores every other field.
+
+## Project structure
+
+- `docker-compose.yml`: runtime definition for the FA API container
+- `.env.example`: ports, model path, dtype, batch size, and chunk limit
+- `fa-api/`: image and FastAPI app
+- `tests/test_contract.py`, `tests/test_alignment_mapping.py`: contract tests that run without model weights
+- `tests/test_asr_then_fa.py`: downloads YouTube audio, calls ASR, then calls this API
+- `tests/test_asr_for_fa_input.py`: downloads YouTube audio, calls ASR, and writes chunk slices without calling FA
+
+## Requirements
+
+- NVIDIA GPU
+- NVIDIA Container Toolkit
+- Docker / Docker Compose
+
+Contract tests need Python and the app dependencies. The YouTube scripts also need `yt-dlp`, `ffmpeg`, and `curl` on the host, plus a running ASR server.
+
+## Model download
+
+Weights are mounted read-only and are not copied into the image. Hub access inside the container is disabled.
+
+```bash
+mkdir -p ../models/stt/hf
+
+hf download Qwen/Qwen3-ForcedAligner-0.6B \
+  --local-dir ../models/stt/hf/Qwen3-ForcedAligner-0.6B
+```
+
+If that directory already exists, no extra download is needed.
+
+## Quick start
+
+1. Copy the example environment file.
 
 ```bash
 cp .env.example .env
 ```
 
-`MODEL_HOST_DIR`는 Compose 파일 기준의 호스트 모델 루트입니다. 기본값은 `../models/stt/hf`이고, 그 안에 `Qwen3-ForcedAligner-0.6B`가 있어야 합니다. 가중치는 이미지에 복사하지 않고 `/models`로 읽기 전용 마운트합니다.
+2. Review the model directory and GPU id in `.env`.
+
+```env
+MODEL_HOST_DIR=../models/stt/hf
+FA_MODEL_PATH=/models/Qwen3-ForcedAligner-0.6B
+FA_GPU_DEVICE=0
+```
+
+`MODEL_HOST_DIR` is relative to the Compose file. Inside the container the model device is always `cuda:0`. `FA_GPU_DEVICE` selects the host GPU.
+
+3. Build and start the container.
 
 ```bash
 docker compose up --build -d
+```
+
+4. Check the API.
+
+```bash
 curl --fail-with-body http://localhost:8090/health
 ```
 
-모델 로드가 끝나면 `/health`가 `200`과 `{"status":"ok","model_loaded":true}`를 반환합니다. 로드에 실패하면 프로세스가 종료됩니다.
+While the model is loading, `/health` and `POST /align` return `503`:
 
-## 입력 WAV
-
-FA에 보내는 파일은 ASR에 보낸 것과 같은 canonical WAV입니다.
-
-- WAV 컨테이너
-- 16,000 Hz
-- mono
-- signed 16-bit PCM
-
-```bash
-ffmpeg -i source_audio.m4a -vn -ar 16000 -ac 1 -c:a pcm_s16le canonical.wav
+```json
+{"status": "loading", "model_loaded": false}
 ```
 
-FA는 리샘플링, 채널 변환, 무음 제거를 하지 않습니다. 30분 파일 전체를 한 요청으로 보낼 수 있습니다. 180초 제한은 파일 전체가 아니라 ASR 청크 하나하나에 적용됩니다. 180초 청크는 허용하고, 그보다 긴 청크는 거부합니다.
+After a successful load, `/health` returns `200`:
 
-## 정렬 요청
+```json
+{"status": "ok", "model_loaded": true}
+```
 
-ASR에는 전체 WAV를 `response_format=verbose_json`, `include_chunks=true`로 한 번 보냅니다. 그 응답 JSON을 수정하지 않고 FA의 `payload`로 보냅니다. FA는 `audio`와 `chunks`만 읽고 나머지 필드는 무시합니다.
+The Compose healthcheck requires `model_loaded`. A load failure exits the process.
+
+## API example
+
+Send the same canonical WAV that was sent to ASR, plus the ASR JSON unchanged:
 
 ```bash
 curl --fail-with-body -X POST http://localhost:8090/align \
@@ -44,45 +105,140 @@ curl --fail-with-body -X POST http://localhost:8090/align \
   -F 'payload=<asr-result.json'
 ```
 
-청크가 하나인 입력으로도 같은 API를 시험할 수 있습니다.
+A single chunk is enough to exercise the same API. Build the WAV first if you do not already have one:
 
 ```bash
+ffmpeg -i source_audio.m4a -vn -ar 16000 -ac 1 -c:a pcm_s16le canonical.wav
+
 curl --fail-with-body -X POST http://localhost:8090/align \
   -F 'file=@canonical.wav;type=audio/wav' \
   -F 'payload={"audio":{"sample_rate":16000,"channels":1,"num_samples":16000},"chunks":[{"index":0,"start_sample":0,"end_sample":16000,"text":"안녕하세요","language":"ko"}]}'
 ```
 
-`chunks[].text`가 비어 있으면 그 청크는 모델에 들어가지 않고 `skipped_empty_text`로 원래 위치에 남습니다. 비어 있지 않은 전사의 언어가 없거나 지원 목록 밖이면 요청은 400입니다.
+## API behavior
 
-## 응답 시간
+`POST /align` is `multipart/form-data` with `file` and `payload`.
 
-`items[].start_time`과 `items[].end_time`은 청크 시작이 아니라 업로드한 WAV 전체의 시작을 0초로 둔 시각입니다. 서버가 `start_sample / 16000`을 한 번 더합니다. 호출자가 같은 오프셋을 다시 더하지 않습니다.
+1. Store the upload under a `fa-align-*` temporary directory.
+2. Reject a WAV that is not signed 16-bit PCM, 16,000 Hz, mono, with at least one frame. This server does not resample, mix channels, or trim silence.
+3. Require `audio.sample_rate` `16000`, `audio.channels` `1`, and `audio.num_samples` equal to the WAV frame count.
+4. Check each chunk's `index`, half-open `[start_sample, end_sample)`, and length. Indexes must be unique and `>= 0`. The span must lie inside `[0, num_samples)`.
+5. Skip chunks whose `text` is empty or whitespace. Send the rest to the model in microbatches of `FA_BATCH_SIZE`.
+6. Clamp each model timestamp to that chunk, then add `start_sample / 16000` once.
+7. Return every input chunk in its original position and delete the temporary directory.
 
-인접 청크가 겹치면 각 청크의 정렬 항목이 그대로 남습니다. 응답의 `overlap_deduplicated`는 `false`입니다. 중복 제거, 문장 재조립, SRT/VTT 생성은 FA 응답을 받은 쪽에서 처리합니다.
+The whole file has no duration cap. `FA_MAX_CHUNK_SECONDS` applies to each chunk. The default and the maximum are 180. A chunk of that length is accepted. A longer chunk is `400`.
 
-## 배치와 메모리
+A skipped chunk stays in place with `status` `skipped_empty_text`, `language` `null`, and `items` `[]`. Its original `text` is preserved. A non-empty chunk with a missing or unsupported language is `400`.
 
-`FA_BATCH_SIZE`는 한 요청 안의 microbatch 크기입니다. 기본값은 4이고, 1도 동작합니다. 요청이 여러 개 들어와도 모델 실행은 한 번에 하나이며, 그 요청 안에서만 배치합니다. 배치를 키우면 처리 시간이 줄 수 있지만 GPU 메모리도 같이 늘어납니다. CUDA OOM을 포함한 모델 실행 오류는 500이고, 일부 청크만 성공한 응답으로 바꾸거나 배치를 자동으로 줄여 재시도하지 않습니다.
+Language aliases are normalized before the model call. The canonical name is what comes back on an aligned chunk. Supported names are Korean, Japanese, Chinese, English, Cantonese, French, German, Italian, Portuguese, Russian, and Spanish. Accepted aliases include `ko`, `ja`/`jp`, `zh`/`zh-cn`/`zh-tw`, `en`, `yue`, `fr`, `de`, `it`, `pt`, `ru`, and `es`, matched case-insensitively after trimming.
 
-`FA_DTYPE`은 `bfloat16`, `float16`, `float32` 중 하나입니다. 기본값은 `bfloat16`입니다.
+`items[].start_time` and `items[].end_time` are seconds from the start of the uploaded WAV. Do not add `start_sample / sample_rate` again. A reversed timestamp fails the request with `500`. Item text that is empty is dropped.
 
-## 구성
+Overlapping chunks are left as aligned. `overlap_deduplicated` is always `false`. Deduplication, sentence reassembly, and SRT/VTT generation belong to the caller.
 
-| 구성 | 역할 |
-|---|---|
-| 외부 서비스 | canonical WAV 생성·보관, ASR 다음 FA 호출, 정렬 이후 후처리 |
-| ASR | 청크 전사와 `start_sample`/`end_sample` 반환 |
-| 이 FA 서버 | WAV 검증, 구간 추출, 배치 정렬, 전체 파일 기준 시간 반환 |
-| InferSwap | 이후 단계. 모델 상주와 런타임 전환 |
+```json
+{
+  "audio": {"sample_rate": 16000, "channels": 1, "num_samples": 16000},
+  "time_reference": "audio_start",
+  "overlap_deduplicated": false,
+  "chunks": [
+    {
+      "index": 0,
+      "start_sample": 0,
+      "end_sample": 16000,
+      "text": "안녕하세요",
+      "language": "Korean",
+      "status": "aligned",
+      "items": [
+        {"text": "안녕", "start_time": 0.1, "end_time": 0.4}
+      ]
+    }
+  ]
+}
+```
 
-컨테이너 안에서 모델 장치는 `cuda:0`입니다. 호스트 GPU 선택은 Compose의 `FA_GPU_DEVICE`가 담당합니다.
+Invalid WAV, metadata mismatch, bad sample spans, duplicate indexes, and unsupported languages are `400` with `{"detail":"..."}`. A model failure, including CUDA OOM, is `500`. The server does not return a partial result and does not shrink the batch and retry.
 
-## 검증
+Concurrent requests do not overlap on the model. Batching stays inside the one request that holds the lock. Cancelling the HTTP request does not stop the worker already running. The lock and the temporary directory are released only after that worker finishes. A request rejected before inference deletes its temporary directory immediately.
 
-모델 없이 실행한 계약 테스트 20개가 통과했습니다. 잘못된 WAV, 메타데이터 불일치, 180초 청크 경계, 언어 정규화, 빈 전사, microbatch 대응, global offset, 동시 요청 직렬화, 취소 시 락과 임시 파일 유지가 여기 포함됩니다.
+Match the ASR server's `CHUNK_SECONDS` to `FA_MAX_CHUNK_SECONDS`. This server does not call ASR.
 
-이미지는 `nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04`와 `torch==2.8.0+cu128`로 빌드했습니다. 컨테이너에서 `Qwen3ForcedAligner` import와 CUDA 사용이 확인되었고, `vllm`은 설치되어 있지 않습니다.
+## Environment variables
 
-RTX 3090에서 로컬 `Qwen3-ForcedAligner-0.6B`를 로드한 뒤 `/health`는 `200`이었습니다. 3초 WAV 한 청크는 `안녕하세요`를 `안녕`, `하세요`로 정렬했고, 시각은 파일 시작 기준이었습니다. 3초 청크 5개를 요청 한 번으로 처리하는 동안 `/health`는 `200`을 유지했고, 응답 후 `fa-align-` 임시 디렉터리는 남아 있지 않았습니다.
+The main settings are in `.env.example`.
 
-같은 5청크 입력을 warmup 뒤에 다시 측정하면 batch 1은 약 0.31초, peak 1791 MiB였고 batch 4는 약 0.15–0.18초, peak 1795 MiB였습니다. batch 1은 `align()`을 1개씩 5번, batch 4는 4개와 1개로 호출했습니다. 두 결과의 청크 순서와 항목 텍스트는 같았고, 시각은 각 청크 범위 안에 있었습니다. 부동소수점 결과의 bitwise 일치는 요구하지 않습니다.
+| Variable | Default | Role |
+|---|---|---|
+| `FA_API_PORT` | `8090` | Host port mapped to container port 8090 |
+| `MODEL_HOST_DIR` | `../models/stt/hf` | Host model root, mounted at `/models` |
+| `FA_MODEL_PATH` | `/models/Qwen3-ForcedAligner-0.6B` | Model directory inside the container |
+| `FA_DTYPE` | `bfloat16` | `bfloat16`, `float16`, or `float32` |
+| `FA_BATCH_SIZE` | `4` | Microbatch size inside one request, integer `>= 1` |
+| `FA_MAX_CHUNK_SECONDS` | `180` | Per-chunk limit, integer from 1 to 180 |
+| `FA_GPU_DEVICE` | `0` | Host GPU id |
+| `LOG_LEVEL` | `info` | Uvicorn log level |
+
+`FA_BATCH_SIZE=1` is valid. A larger batch can reduce runtime and increase GPU memory.
+
+The YouTube scripts read extra variables from the environment or from `.env`. They are not part of the container config.
+
+- `STT_BASE_URL`: ASR base URL, default `http://localhost:8080`
+- `FA_BASE_URL`: this API, default `http://localhost:8090` (`tests/test_asr_then_fa.py` only)
+- `STT_MODEL`: ASR model name, default `qwen3-asr`
+- `DEFAULT_LANGUAGE`: language sent to ASR, default `ko`
+- `STT_HEALTH_RETRIES`: health retries, default `30`
+- `STT_HEALTH_BACKOFF_SEC`: seconds between health retries, default `2`
+- `STT_REQUEST_TIMEOUT_SECONDS`: request timeout, default `7200`
+- `STT_OUTPUT_DIR`: used only by `tests/test_asr_for_fa_input.py`
+
+## Tests
+
+### Contract tests
+
+These run without model weights:
+
+```bash
+python -m pytest tests/test_contract.py tests/test_alignment_mapping.py
+```
+
+They cover invalid WAV input, metadata mismatch, the chunk-length boundary, language normalization, empty text, microbatch grouping, the global time offset, serialized concurrent requests, and lock plus temp-file behavior on cancellation.
+
+### ASR, then FA
+
+`tests/test_asr_then_fa.py` downloads one YouTube video, writes a canonical WAV, sends that file to ASR with `response_format=verbose_json` and `include_chunks=true`, then sends the same WAV and the unmodified ASR JSON to this API. The host needs `yt-dlp`, `ffmpeg`, and `curl`. ASR and FA must already be up.
+
+```bash
+python3 tests/test_asr_then_fa.py
+```
+
+Set the YouTube URL at the top of `tests/test_asr_then_fa.py`. Outputs go to `tests/outputs/`, which is gitignored.
+
+- `source.wav`: PCM file sent to ASR and FA
+- `asr.json`: original ASR response
+- `alignment.json`: FA response
+- `timings.json`: `transcription_elapsed_sec` and `alignment_elapsed_sec`
+
+### Alignment inputs only
+
+`tests/test_asr_for_fa_input.py` stops after ASR. It does not call this API. The host needs `yt-dlp`, `ffmpeg`, and `curl`, and the ASR server must be up.
+
+```bash
+python3 tests/test_asr_for_fa_input.py
+```
+
+Set the YouTube URL at the top of that file. The default output directory is `scripts/outputs/alignment/` (`STT_OUTPUT_DIR` plus `alignment`).
+
+- `source.wav`: PCM file uploaded to ASR
+- `response.json`: full `verbose_json` body, including `audio` and `chunks`
+- `chunks/chunk-NNNN.wav`: PCM slice for `[start_sample, end_sample)`
+- `chunks/chunk-NNNN.txt`: that chunk's pre-merge `text`. Empty `text` is not written
+- `manifest.json`: sample counts, kept chunk paths, and `skipped_empty` indexes
+
+To align those inputs, send `source.wav` and `response.json` together to `POST /align`. Do not add the chunk offset to the returned times.
+
+## Notes
+
+- The image is `nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04` with `torch==2.8.0` from the cu128 wheel and `qwen-asr==0.0.6`. Startup checks that the model's supported languages match the list above.
+- Only `FA_API_PORT` is published. The default is `8090`.
+- `HF_HUB_OFFLINE` and `TRANSFORMERS_OFFLINE` are set in Compose, so the container will not download weights at startup.
