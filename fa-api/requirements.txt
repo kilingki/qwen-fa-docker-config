@@ -1,0 +1,8 @@
+# torch==2.8.0+cu128 is installed from https://download.pytorch.org/whl/cu128
+# in the Dockerfile before this file, so PyPI does not replace the CUDA wheel.
+fastapi==0.141.1
+uvicorn[standard]==0.53.0
+python-multipart==0.0.32
+numpy==2.5.3
+soundfile==0.14.0
+qwen-asr==0.0.6

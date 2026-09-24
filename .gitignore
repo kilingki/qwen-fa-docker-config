@@ -1,1 +1,6 @@
-.local/
+local/
+tests/outputs/
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
