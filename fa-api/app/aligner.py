@@ -86,6 +86,19 @@ class ForcedAlignerService:
         self._aligner = aligner
         self.loaded = True
 
+    def release(self) -> None:
+        self._aligner = None
+        self.loaded = False
+
+    def holds_model(self) -> bool:
+        return self._aligner is not None
+
+    def validate_request(self, wav_path: str, payload: Any) -> None:
+        parsed = payload if isinstance(payload, Payload) else parse_payload(payload)
+        waveform = read_canonical_wav(wav_path)
+        self._check_audio_metadata(parsed, waveform)
+        self._prepare_jobs(parsed)
+
     def _load_aligner(self) -> Any:
         import torch
         from qwen_asr import Qwen3ForcedAligner

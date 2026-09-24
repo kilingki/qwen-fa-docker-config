@@ -1,6 +1,6 @@
 # qwen-fa-docker-config
 
-Single-container Docker deployment for Qwen3 ForcedAligner. The container loads `Qwen3-ForcedAligner-0.6B` once, then aligns one canonical WAV and an ASR chunk payload on `POST /align`.
+Single-container Docker deployment for Qwen3 ForcedAligner. The process starts without loading weights. `POST /control/load` loads `Qwen3-ForcedAligner-0.6B`, then `POST /align` aligns one canonical WAV and an ASR chunk payload.
 
 The runtime is one Compose service:
 
@@ -24,6 +24,7 @@ The client is expected to already have a 16 kHz mono signed-16 PCM WAV and the u
 ## Project structure
 
 - `docker-compose.yml`: runtime definition for the FA API container
+- `prepare-inferswap`: starts the container only when it does not already exist
 - `.env.example`: ports, model path, dtype, batch size, and chunk limit
 - `fa-api/`: image and FastAPI app
 - `tests/test_contract.py`, `tests/test_alignment_mapping.py`: contract tests that run without model weights
@@ -75,25 +76,37 @@ FA_GPU_DEVICE=0
 docker compose up --build -d
 ```
 
-4. Check the API.
+4. Confirm the process is up, then load the model.
 
 ```bash
+curl --fail-with-body http://localhost:8090/control/status
+curl --fail-with-body -X POST http://localhost:8090/control/load
 curl --fail-with-body http://localhost:8090/health
 ```
 
-While the model is loading, `/health` and `POST /align` return `503`:
+Right after start, status is:
+
+```json
+{"state": "unloaded", "residency": "not_resident", "active_requests": 0, "last_error": null}
+```
+
+`/health` and `POST /align` return `503` until load finishes:
 
 ```json
 {"status": "loading", "model_loaded": false}
 ```
 
-After a successful load, `/health` returns `200`:
+A finished load returns `200` with `"state": "ready"` and `"residency": "resident"`. `/health` is then `200`:
 
 ```json
 {"status": "ok", "model_loaded": true}
 ```
 
-The Compose healthcheck requires `model_loaded`. A load failure exits the process.
+`POST /control/load` and `POST /control/unload` accept an empty body or `{}`. Calling load again when the model is ready does not load it a second time. Unload returns to `unloaded` / `not_resident`. Missing weights or a language-list mismatch stay in the process as `state=failed` on the load response. They do not exit the process.
+
+The Compose healthcheck passes when `GET /control/status` returns `200`. It does not wait for the model.
+
+`./prepare-inferswap` runs `docker compose up -d` only when the `fa-api` container does not exist. It does not load the model. If the container already exists and status returns `200`, it leaves that container alone. If the container exists but status fails, it exits non-zero and does not restart it.
 
 ## API example
 
@@ -202,11 +215,11 @@ These run without model weights:
 python -m pytest tests/test_contract.py tests/test_alignment_mapping.py
 ```
 
-They cover invalid WAV input, metadata mismatch, the chunk-length boundary, language normalization, empty text, microbatch grouping, the global time offset, serialized concurrent requests, and lock plus temp-file behavior on cancellation.
+They cover invalid WAV input, metadata mismatch, the chunk-length boundary, language normalization, empty text, microbatch grouping, the global time offset, serialized concurrent requests, lock plus temp-file behavior on cancellation, and model load/unload status.
 
 ### ASR, then FA
 
-`tests/test_asr_then_fa.py` downloads one YouTube video, writes a canonical WAV, sends that file to ASR with `response_format=verbose_json` and `include_chunks=true`, then sends the same WAV and the unmodified ASR JSON to this API. The host needs `yt-dlp`, `ffmpeg`, and `curl`. ASR and FA must already be up.
+`tests/test_asr_then_fa.py` downloads one YouTube video, writes a canonical WAV, sends that file to ASR with `response_format=verbose_json` and `include_chunks=true`, loads this model with `POST /control/load`, then sends the same WAV and the unmodified ASR JSON to this API. The host needs `yt-dlp`, `ffmpeg`, and `curl`. ASR must already be up, and this container must be up. The script loads the model itself.
 
 ```bash
 python3 tests/test_asr_then_fa.py
@@ -235,10 +248,14 @@ Set the YouTube URL at the top of that file. The default output directory is `sc
 - `chunks/chunk-NNNN.txt`: that chunk's pre-merge `text`. Empty `text` is not written
 - `manifest.json`: sample counts, kept chunk paths, and `skipped_empty` indexes
 
-To align those inputs, send `source.wav` and `response.json` together to `POST /align`. Do not add the chunk offset to the returned times.
+To align those inputs, load the model, then send `source.wav` and `response.json` together to `POST /align`. Do not add the chunk offset to the returned times.
+
+### GPU lifecycle check
+
+`tests/check_gpu_lifecycle.py` loads, aligns one second of audio, and unloads three times inside the image. It records `torch.cuda.memory_allocated` and checks that `/control/status` keeps answering during load and alignment. Run it with the image's Python on a GPU, with the model mounted at `FA_MODEL_PATH`.
 
 ## Notes
 
-- The image is `nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04` with `torch==2.8.0` from the cu128 wheel and `qwen-asr==0.0.6`. Startup checks that the model's supported languages match the list above.
+- The image is `nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04` with `torch==2.8.0` from the cu128 wheel and `qwen-asr==0.0.6`. Load checks that the model's supported languages match the list above. Uvicorn uses one worker.
 - Only `FA_API_PORT` is published. The default is `8090`.
 - `HF_HUB_OFFLINE` and `TRANSFORMERS_OFFLINE` are set in Compose, so the container will not download weights at startup.

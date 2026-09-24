@@ -137,6 +137,9 @@ def wait_for_health() -> None:
 
 
 def wait_for_fa_health() -> None:
+    status, payload = http_json("POST", f"{FA_BASE_URL}/control/load")
+    if status != 200 or payload.get("state") != "ready":
+        raise RuntimeError(f"FA load did not become ready: {status} {payload}")
     wait_until_ready(
         f"{FA_BASE_URL}/health",
         lambda payload: payload.get("status") == "ok" and payload.get("model_loaded") is True,

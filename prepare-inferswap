@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Start the FA container only when it does not exist. Does not load the model
+# and does not restart a container that is already present.
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+port="${FA_API_PORT:-}"
+if [[ -z "$port" && -f .env ]]; then
+  port="$(grep -E '^[[:space:]]*FA_API_PORT=' .env | tail -n 1 | cut -d= -f2- | tr -d '[:space:]"'"'" || true)"
+fi
+port="${port:-8090}"
+
+status_ok() {
+  curl -fsS --max-time 4 "http://127.0.0.1:${port}/control/status" >/dev/null
+}
+
+existing="$(docker compose ps -aq fa-api || true)"
+if [[ -z "$existing" ]]; then
+  docker compose up -d
+  for _ in $(seq 1 60); do
+    if status_ok; then
+      exit 0
+    fi
+    sleep 1
+  done
+  echo "fa-api was created but GET /control/status did not return 200" >&2
+  exit 1
+fi
+
+if status_ok; then
+  exit 0
+fi
+
+echo "fa-api container exists but GET /control/status failed; not restarting" >&2
+exit 1
