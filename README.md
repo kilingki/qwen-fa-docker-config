@@ -21,6 +21,8 @@ Calling ASR, assembling subtitles, removing overlap duplicates, and swapping run
 
 The client is expected to already have a 16 kHz mono signed-16 PCM WAV and the unmodified ASR JSON for that file. This server reads `audio` and `chunks` from that JSON and ignores every other field.
 
+The aligner checkpoint is [Qwen/Qwen3-ForcedAligner-0.6B](https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B). Transcription stays on a separate server. The YouTube scripts call `POST /v1/audio/transcriptions` with `response_format=verbose_json` and `include_chunks=true`. That shape matches the Qwen3-ASR family, for example [Qwen/Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B).
+
 ## Project structure
 
 - `docker-compose.yml`: runtime definition for the FA API container
@@ -33,15 +35,17 @@ The client is expected to already have a 16 kHz mono signed-16 PCM WAV and the u
 
 ## Requirements
 
-- NVIDIA GPU
+- NVIDIA GPU. The checkpoint is about 1.8 GB of BF16 weights, and the GPU must also hold activations. `FA_BATCH_SIZE` and chunk length raise peak memory.
 - NVIDIA Container Toolkit
 - Docker / Docker Compose
 
-Contract tests need Python and the app dependencies. The YouTube scripts also need `yt-dlp`, `ffmpeg`, and `curl` on the host, plus a running ASR server.
+Compose sets `shm_size` to 4 GB. That is container shared memory (`/dev/shm`), separate from GPU memory.
+
+Contract tests need Python 3.10 or newer and the app dependencies. The image uses Ubuntu 24.04's Python 3. The YouTube scripts also need `yt-dlp`, `ffmpeg`, and `curl` on the host, plus a running ASR server.
 
 ## Model download
 
-Weights are mounted read-only and are not copied into the image. Hub access inside the container is disabled.
+Weights are mounted read-only and are not copied into the image. Hub access inside the container is disabled. The [Qwen/Qwen3-ForcedAligner-0.6B](https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B) snapshot is about 1.8 GB and is licensed separately from this repository.
 
 ```bash
 mkdir -p ../models/stt/hf
@@ -256,6 +260,10 @@ To align those inputs, load the model, then send `source.wav` and `response.json
 
 ## Notes
 
-- The image is `nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04` with `torch==2.8.0` from the cu128 wheel and `qwen-asr==0.0.6`. Load checks that the model's supported languages match the list above. Uvicorn uses one worker.
-- Only `FA_API_PORT` is published. The default is `8090`.
+- The image is `nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04` with `torch==2.8.0` from the cu128 wheel and `qwen-asr==0.0.6`. Load checks that the model's supported languages match the list above. Uvicorn uses one worker and listens on `0.0.0.0` inside the container.
+- Only `FA_API_PORT` is published. The default is `8090`. The API has no authentication. FastAPI also serves `/docs`, `/redoc`, and `/openapi.json`. Keep the published port on a private interface.
 - `HF_HUB_OFFLINE` and `TRANSFORMERS_OFFLINE` are set in Compose, so the container will not download weights at startup.
+
+## License
+
+[Qwen/Qwen3-ForcedAligner-0.6B](https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B) weights are [Apache-2.0](https://www.apache.org/licenses/LICENSE-2.0) and are not part of this repository. This repository has no `LICENSE` file. The model license does not cover the deployment code.
