@@ -26,7 +26,7 @@ The aligner checkpoint is [Qwen/Qwen3-ForcedAligner-0.6B](https://huggingface.co
 ## Project structure
 
 - `docker-compose.yml`: runtime definition for the FA API container
-- `prepare-inferswap`: starts the container only when it does not already exist
+- `prepare-inferswap`: start the container when it is down, or leave a running container unchanged
 - `.env.example`: ports, model path, dtype, batch size, and chunk limit
 - `fa-api/`: image and FastAPI app
 - `tests/test_contract.py`, `tests/test_alignment_mapping.py`: contract tests that run without model weights
@@ -110,7 +110,7 @@ A finished load returns `200` with `"state": "ready"` and `"residency": "residen
 
 The Compose healthcheck passes when `GET /control/status` returns `200`. It does not wait for the model.
 
-`./prepare-inferswap` runs `docker compose up -d` only when the `fa-api` container does not exist. It does not load the model. If the container already exists and status returns `200`, it leaves that container alone. If the container exists but status fails, it exits non-zero and does not restart it.
+`./prepare-inferswap` runs `docker compose up -d --no-build --no-recreate` when the `fa-api` container is missing or stopped. It does not build an image and does not load the model. A newly started process must report `unloaded` / `not_resident` with no active requests. If the container is already running and `GET /control/status` succeeds, the script exits 0 and does not restart or unload it. If that check fails, it exits non-zero and does not recreate the container.
 
 ## API example
 
